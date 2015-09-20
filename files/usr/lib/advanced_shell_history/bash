@@ -15,108 +15,186 @@
 #   limitations under the License.
 #
 
-# Prevent errors from sourcing this file mor than once.
-[[ -n "${ASH_SESSION_ID}" ]] && return
+# Avoid duplicate sourcing
+if [[ "$__ash_sourced" == "sourced" ]]; then
+    return 0
+fi
+__ash_sourced="sourced"
 
 # Make sure we are running the shell we think we are running.
 if ! ps ho command $$ | grep -q "bash"; then
   echo "The shell process name implies you're not running bash..."
-  return
-fi
-
-# Use the default config file if one was not specified.
-export ASH_CFG="${ASH_CFG:-/etc/ash/ash.conf}"
-
-# Source the config files to set all ASH_ shell variables.
-source <( grep "^[ ]*ASH_[A-Za-z_0-9]*=['\"].*['\"].*$" "${ASH_CFG}" \
-            | tr -cd '\11\12\15\40-\176' ) || exit 1
-
-export $( sed -n -e "/^[ ]*ASH_[A-Za-z_0-9]*=.*/s:=.*::p" "${ASH_CFG}" )
-
-# Make the env config options read-only if that option is set.
-if [[ "${ASH_CFG_READONLY_ENV:-0}" != "0" ]]; then
-  readonly $( sed -n -e "/^[ ]*ASH_[A-Za-z_0-9]*=.*/s:=.*::p" "${ASH_CFG}" )
+  return 1
 fi
 
 source "${ASH_CFG_LIB}/common" || exit 1
 
+ash::log() {
+    local cmd=${FUNCNAME[2]} level="$1"
+    shift
+    >&2 printf "%s %s: (%s) %s\n" "$(date --rfc-3339=seconds)" "$level" "$cmd" "$@"
+}
 
-# Display error and abort if PROMPT_COMMAND is readonly.
-if readonly -p | grep -q "^declare -[[:alpha:]]\+ PROMPT_COMMAND="; then
-  if [[ "${PROMPT_COMMAND//ash::/}" == "${PROMPT_COMMAND}" ]]; then
-    ${ASH_LOG_BIN} -a "Make PROMPT_COMMAND writable to save advanced shell history."
-    return
-  fi
-fi
-export PROMPT_COMMAND='ASH=1 ash::begin_session'
+ash::die() {
+    ASH=1 ash::log FATAL "${@}"
+    exit 1
+}
 
-# HISTCONTROL is emptied primarily to remove the options that de-dupe identical
-# successive commands and remove comands with leading spaces from history.
-export HISTCONTROL=""
-readonly HISTCONTROL
+ash::info() {
+    ASH=1 ash::log INFO "${@}"
+}
 
-# HISTTIMEFORMAT is changed to unix epoch time to allow easy duration
-# calculations by subtracting start from end timestamps.
-export HISTTIMEFORMAT="%s "
-readonly HISTTIMEFORMAT
+# Check if bash-preexec has been sourced.
+function ash::has_preexec() {
+    if [[ "$__bp_imported" == "defined" ]]; then
+        return 0
+    fi
+    return 1
+}
 
+function ash::has_ash() {
+    ash::file_exists "${ASH_CFG_LIB}/common" || return 1
+    ash::file_exists "$ASH_CFG_HISTORY_DB" || return 2
+    ash::file_exists "$ASH_CFG_LOG_FILE" || return 3
+    return 0
+}
 
-##
-# This is invoked when a new user session begins.
-#
+# Util-function
+function ash::file_exists() {
+    local fn="$1"
+    [ -n "$fn" ] || return 1
+    [ -f "$fn" ] || return 2
+    return 0
+}
+
+# Read ash config and export as shell vars
+function ash::read_config() {
+    [ -n "$1" ] && export ASH_CFG=$1
+    [ -z "${ASH_CFG}" ] && export ASH_CFG="/etc/ash/ash.conf"
+    ash::file_exists "${ASH_CFG}" || return 1
+
+    # Source the config files to set all ASH_ shell variables.
+    source <( grep "^[ ]*ASH_[A-Za-z_0-9]*=['\"].*['\"].*$" "${ASH_CFG}" \
+                | tr -cd '\11\12\15\40-\176' ) || return 2
+
+    export $( sed -n -e "/^[ ]*ASH_[A-Za-z_0-9]*=.*/s:=.*::p" "${ASH_CFG}" )
+}
+
+# Assert that an ASH_SESSION_ID is created
+function ash::assert_id() {
+    [ -n "${ASH_SESSION_ID}" ] && return
+    export ASH_SESSION_ID="$( ${ASH_LOG_BIN} --get_session_id )"
+    readonly ASH_SESSION_ID
+    [ -n "${ASH_SESSION_ID}" ] || return 1
+}
+
+# Begin session
 function ash::begin_session() {
-  # Prevent users from manually invoking this function from the command line.
-  [[ "${ASH:-0}" == "0" ]] && ash::info ash::begin_session && return
-
-  export PROMPT_COMMAND="ASH=1 ash::precmd \${?} \${PIPESTATUS[@]}"
-  export ASH_SESSION_ID="$( ${ASH_LOG_BIN} --get_session_id )"
-  if [[ -n "${ASH_CFG_MOTD:-}" ]]; then
-    ${ASH_LOG_BIN} -a "${ASH_CFG_MOTD}session ${ASH_SESSION_ID}"
-  fi
-  readonly ASH_SESSION_ID PROMPT_COMMAND
+    ash::assert_id || return 1
+    if [ -n "${ASH_CFG_MOTD:-}" ]; then
+        ${ASH_LOG_BIN} -a "${ASH_CFG_MOTD}session ${ASH_SESSION_ID}"
+    fi
 }
 
-
-##
-# Log the previous command and execute the previous PROMPT_COMMAND (if any)
-# afterward.  The previous command exit code is reset after this function.
-#
+# Log previuous command
 function ash::precmd() {
-  # Do nothing if this variable is set.
-  [[ -n "${ASH_DISABLED:-}" ]] && return
-
-  # Prevent users from manually invoking this function from the command line.
-  [[ "${ASH:-0}" == "0" ]] && ash::info ash::precmd && return
-
-  ash::log ${@:-0 0}
-  if typeset -p ASH_PROMPT_COMMAND &>/dev/null; then
-    "${ASH_PROMPT_COMMAND}"
-  fi
-  # Causes the exit code to be reset to what it was before logging.
-  local rval=${1:-0} && shift
-  ASH_PIPESTATUS=( ${@:-0} )
-  ${ASH_LOG_BIN} --exit ${rval}
+    # Do nothing if this variable is set.
+    [ -n "${ASH_DISABLED:-}" ] && return
+    ash::assert_id || return 1
+    ASH=1 ash::log ${@:-0 0}
+    # Causes the exit code to be reset to what it was before logging.
+    local rval=${1:-0} && shift
+    ASH_PIPESTATUS=( ${@:-0} )
+    ${ASH_LOG_BIN} --exit ${rval}
 }
 
-
-##
-# Invoked by ash::log.
-#
+# Get last command?
 function ash::last_command() {
-  # Prevent users from manually invoking this function from the command line.
-  [[ "${ASH:-0}" == "0" ]] && ash::info ash::last_command && return
+    local _old_hist=$HISTTIMEFORMAT
+    local cmd_no start_ts end_ts="$( date +%s )" cmd
+    export HISTTIMEFORMAT='%s '
+    read -r cmd_no start_ts cmd <<< "$( builtin history 1 )"
+    export HISTTIMEFORMAT=$_old_hist
+    echo ${cmd_no:-0} ${start_ts:-0} ${end_ts:-0} "${cmd:-UNKNOWN}"
+}
 
-  local cmd_no start_ts end_ts="$( date +%s )" cmd
-  read -r cmd_no start_ts cmd <<< "$( builtin history 1 )"
-  echo ${cmd_no:-0} ${start_ts:-0} ${end_ts:-0} "${cmd:-UNKNOWN}"
+# Info msg
+function ash::info() {
+    cat << EOF_INFO
+${@:-This} is an internal function of the advanced shell history utility.
+EOF_INFO
+}
+
+# This is invoked immediately before each new prompt is displayed for the user.
+#
+# Args:
+#   rval: The numeric exit code from the last user-entered command.
+#   pipes: The set of pipe exit codes (one or more codes).
+function ash::log() {
+    # Prevent users from manually invoking this function from the command line.
+    [ "${ASH:-0}" == "0" ] && ash::info ash::log && return
+
+    # ASH_SKIP is set only when the user presses Ctrl-C while entering a command.
+    # Since this kills the command before it was executed, there's no history to
+    # log before the next prompt is drawn.
+    if [[ "${ASH_SKIP:-1}" == "1" ]]; then
+        ASH_SKIP=0
+        return
+    fi
+
+    local no start end cmd rval="${1}" && shift
+    read -r no start end cmd <<< "$( ash::last_command )"
+    local pipes="$( sed -e 's: :_:g' <<< "${@}" )"
+
+    # Log the command.
+    ${ASH_LOG_BIN} \
+      -e ${rval:-0} \
+      -s ${start:-0} \
+      -f ${end:-0} \
+      -n ${no:-0} \
+      -p "${pipes:-0}" \
+      -c "${cmd:-UNKNOWN}"
+}
+
+# This is invoked when a user session is exited.
+#
+# Args:
+#   rval: The numeric exit code from the last user-entered command.
+function ash::end_session() {
+    # Prevent users from manually invoking this function from the command line.
+    [ "${ASH:-0}" == "0" ] && ash::info ash::end_session && return
+
+    ash::log "${@}"
+    ${ASH_LOG_BIN} --end_session --exit ${1}
 }
 
 
 # Protect the functions.
+readonly -f ash::has_preexec
+readonly -f ash::has_ash
+readonly -f ash::file_exists
+readonly -f ash::read_config
 readonly -f ash::begin_session
 readonly -f ash::last_command
 readonly -f ash::precmd
+readonly -f ash::end_session
+readonly -f ash::log
 
-# Export functions used by subshells (not begin_session).
-#export -f ash::last_command
-#export -f ash::precmd
+ash::read_config || return 1
+source "${ASH_CFG_LIB}/common" || return 2
+ash::has_preexec || return 3
+ash::has_ash || return 4
+
+# This is executed when the user types 'exit'
+trap 'ASH=1 ash::end_session ${?} ${PIPESTATUS[@]} ${pipestatus[@]}' EXIT TERM
+
+# This avoids logging duplicate commands when the user presses Ctrl-C while
+# entering a command.
+trap 'ASH_SKIP=1' INT
+export ASH_SKIP=0
+
+ash::begin_session || return 5
+
+# TODO: Add alternate PROMPT_COMMAND thingy
+ash_precmd_wrapper() { ash::precmd ${?-0} 0; }
+precmd_functions+=(ash_precmd_wrapper)
